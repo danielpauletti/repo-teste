@@ -1,4 +1,3 @@
-```yaml
 name: Merge develop and create release
 
 run-name: Release ${{ inputs.tag_name }} by ${{ github.actor }}
@@ -309,4 +308,3 @@ jobs:
             echo "- Release: \`Release ${TAG_NAME}\`"
             echo "- Solicitado por: \`${TRIGGERED_BY}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
-```
