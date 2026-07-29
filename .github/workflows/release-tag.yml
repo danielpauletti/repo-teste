@@ -1,1 +1,312 @@
+```yaml
+name: Merge develop and create release
 
+run-name: Release ${{ inputs.tag_name }} by ${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Nome da tag. Exemplo: v1.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Create PR, merge, tag and release
+    runs-on: ubuntu-latest
+
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      TAG_NAME: ${{ inputs.tag_name }}
+      REPOSITORY: ${{ github.repository }}
+      TRIGGERED_BY: ${{ github.actor }}
+
+    steps:
+      - name: Validar configuração do token
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error title=Token não configurado::O secret RELEASE_TOKEN não foi configurado no repositório."
+            echo "::error::Cadastre um PAT pertencente ao usuário autorizado a realizar bypass das regras da branch main."
+            exit 1
+          fi
+
+          if ! gh auth status >/tmp/gh-auth-status.log 2>&1; then
+            echo "::error title=Token inválido::Não foi possível autenticar no GitHub usando o secret RELEASE_TOKEN."
+            cat /tmp/gh-auth-status.log
+            exit 1
+          fi
+
+          AUTHENTICATED_USER="$(gh api user --jq '.login' 2>/tmp/gh-user-error.log)" || {
+            echo "::error title=Falha na autenticação::Não foi possível identificar o usuário associado ao RELEASE_TOKEN."
+            cat /tmp/gh-user-error.log
+            exit 1
+          }
+
+          echo "Workflow iniciado por: ${TRIGGERED_BY}"
+          echo "Merge será executado como: ${AUTHENTICATED_USER}"
+
+      - name: Checkout da main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Configurar Git
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          AUTHENTICATED_USER="$(gh api user --jq '.login')"
+
+          git config user.name "${AUTHENTICATED_USER}"
+          git config user.email "${AUTHENTICATED_USER}@users.noreply.github.com"
+
+      - name: Validar nome e disponibilidade da tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TAG_NAME}" ]; then
+            echo "::error title=Tag inválida::O nome da tag não pode estar vazio."
+            exit 1
+          fi
+
+          if ! git check-ref-format "refs/tags/${TAG_NAME}"; then
+            echo "::error title=Tag inválida::O valor '${TAG_NAME}' não é um nome de tag Git válido."
+            exit 1
+          fi
+
+          git fetch origin --tags --prune
+
+          if git show-ref --verify --quiet "refs/tags/${TAG_NAME}"; then
+            echo "::error title=Tag já existente::A tag '${TAG_NAME}' já existe no repositório."
+            exit 1
+          fi
+
+          if gh release view "${TAG_NAME}" \
+            --repo "${REPOSITORY}" >/dev/null 2>&1; then
+            echo "::error title=Release já existente::Já existe uma release associada à tag '${TAG_NAME}'."
+            exit 1
+          fi
+
+      - name: Verificar branches
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin main develop --prune
+
+          if ! git show-ref --verify --quiet "refs/remotes/origin/main"; then
+            echo "::error title=Branch inexistente::A branch remota 'main' não foi encontrada."
+            exit 1
+          fi
+
+          if ! git show-ref --verify --quiet "refs/remotes/origin/develop"; then
+            echo "::error title=Branch inexistente::A branch remota 'develop' não foi encontrada."
+            exit 1
+          fi
+
+          if git merge-base --is-ancestor origin/develop origin/main; then
+            echo "::error title=Nenhuma alteração para publicar::A branch develop já está completamente incorporada à main."
+            exit 1
+          fi
+
+      - name: Verificar se já existe PR aberta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXISTING_PR="$(
+            gh pr list \
+              --repo "${REPOSITORY}" \
+              --base main \
+              --head develop \
+              --state open \
+              --json number,url \
+              --jq '.[0].url // empty'
+          )"
+
+          if [ -n "${EXISTING_PR}" ]; then
+            echo "::error title=Pull Request já existente::Já existe uma PR aberta de develop para main: ${EXISTING_PR}"
+            echo "::error::Feche ou conclua essa PR antes de executar novamente o workflow."
+            exit 1
+          fi
+
+      - name: Criar Pull Request
+        id: create_pr
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PR_URL="$(
+            gh pr create \
+              --repo "${REPOSITORY}" \
+              --base main \
+              --head develop \
+              --title "Release ${TAG_NAME}" \
+              --body "PR de release criada automaticamente por @${TRIGGERED_BY}.
+
+          Após o merge:
+          - será criada a tag \`${TAG_NAME}\`;
+          - será criada a release \`Release ${TAG_NAME}\`."
+          )"
+
+          PR_NUMBER="${PR_URL##*/}"
+
+          if ! [[ "${PR_NUMBER}" =~ ^[0-9]+$ ]]; then
+            echo "::error title=Falha ao identificar PR::A PR foi criada, mas não foi possível identificar seu número."
+            echo "::error::URL retornada: ${PR_URL}"
+            exit 1
+          fi
+
+          echo "pr_url=${PR_URL}" >> "${GITHUB_OUTPUT}"
+          echo "pr_number=${PR_NUMBER}" >> "${GITHUB_OUTPUT}"
+
+          echo "PR criada: ${PR_URL}"
+
+      - name: Fazer merge da PR com bypass
+        id: merge_pr
+        shell: bash
+        env:
+          PR_NUMBER: ${{ steps.create_pr.outputs.pr_number }}
+          PR_URL: ${{ steps.create_pr.outputs.pr_url }}
+        run: |
+          set -uo pipefail
+
+          AUTHENTICATED_USER="$(gh api user --jq '.login')"
+
+          set +e
+          MERGE_OUTPUT="$(
+            gh pr merge "${PR_NUMBER}" \
+              --repo "${REPOSITORY}" \
+              --merge \
+              --admin \
+              --subject "Merge develop into main for ${TAG_NAME}" \
+              --body "Release ${TAG_NAME}" \
+              2>&1
+          )"
+          MERGE_EXIT_CODE=$?
+          set -e
+
+          echo "${MERGE_OUTPUT}"
+
+          if [ "${MERGE_EXIT_CODE}" -ne 0 ]; then
+            echo "::error title=Merge bloqueado::Não foi possível realizar o merge da PR ${PR_URL}."
+            echo "::error::O usuário '${AUTHENTICATED_USER}', associado ao secret RELEASE_TOKEN, não conseguiu realizar o bypass das regras aplicadas à branch main."
+            echo "::error::Possíveis causas: o usuário não é administrador, não está na lista de bypass do ruleset, administradores também estão sujeitos às regras, o método merge está desabilitado ou o token não possui as permissões necessárias."
+            echo "::error::Mensagem retornada pelo GitHub CLI: ${MERGE_OUTPUT}"
+            exit "${MERGE_EXIT_CODE}"
+          fi
+
+      - name: Confirmar que a PR foi mesclada
+        id: confirm_merge
+        shell: bash
+        env:
+          PR_NUMBER: ${{ steps.create_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          PR_STATE="$(
+            gh pr view "${PR_NUMBER}" \
+              --repo "${REPOSITORY}" \
+              --json state \
+              --jq '.state'
+          )"
+
+          MERGED_AT="$(
+            gh pr view "${PR_NUMBER}" \
+              --repo "${REPOSITORY}" \
+              --json mergedAt \
+              --jq '.mergedAt // empty'
+          )"
+
+          MERGE_COMMIT="$(
+            gh pr view "${PR_NUMBER}" \
+              --repo "${REPOSITORY}" \
+              --json mergeCommit \
+              --jq '.mergeCommit.oid // empty'
+          )"
+
+          if [ "${PR_STATE}" != "MERGED" ] || [ -z "${MERGED_AT}" ]; then
+            echo "::error title=Merge não confirmado::A PR #${PR_NUMBER} não aparece como mesclada."
+            echo "::error::Estado retornado: ${PR_STATE}"
+            exit 1
+          fi
+
+          if [ -z "${MERGE_COMMIT}" ]; then
+            echo "::error title=Commit não encontrado::O GitHub não retornou o commit resultante do merge."
+            exit 1
+          fi
+
+          echo "merge_commit=${MERGE_COMMIT}" >> "${GITHUB_OUTPUT}"
+          echo "PR #${PR_NUMBER} mesclada no commit ${MERGE_COMMIT}."
+
+      - name: Atualizar a main após o merge
+        shell: bash
+        env:
+          EXPECTED_MERGE_COMMIT: ${{ steps.confirm_merge.outputs.merge_commit }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin main --prune
+          git checkout main
+          git reset --hard origin/main
+
+          CURRENT_MAIN_COMMIT="$(git rev-parse HEAD)"
+
+          if [ "${CURRENT_MAIN_COMMIT}" != "${EXPECTED_MERGE_COMMIT}" ]; then
+            echo "::error title=Main alterada após o merge::O HEAD atual da main não corresponde ao commit retornado pela PR."
+            echo "::error::Commit esperado: ${EXPECTED_MERGE_COMMIT}"
+            echo "::error::Commit atual: ${CURRENT_MAIN_COMMIT}"
+            echo "::error::A tag não será criada para evitar marcar um commit inesperado."
+            exit 1
+          fi
+
+      - name: Criar e enviar tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git tag -a "${TAG_NAME}" -m "Release ${TAG_NAME}"
+          git push origin "refs/tags/${TAG_NAME}"
+
+      - name: Criar release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release create "${TAG_NAME}" \
+            --repo "${REPOSITORY}" \
+            --title "Release ${TAG_NAME}" \
+            --generate-notes \
+            --verify-tag
+
+      - name: Resumo
+        shell: bash
+        env:
+          PR_URL: ${{ steps.create_pr.outputs.pr_url }}
+        run: |
+          {
+            echo "## Release criada"
+            echo
+            echo "- PR: ${PR_URL}"
+            echo "- Branch de origem: \`develop\`"
+            echo "- Branch de destino: \`main\`"
+            echo "- Tag: \`${TAG_NAME}\`"
+            echo "- Release: \`Release ${TAG_NAME}\`"
+            echo "- Solicitado por: \`${TRIGGERED_BY}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+```
